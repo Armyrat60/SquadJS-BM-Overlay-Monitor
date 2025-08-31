@@ -41,7 +41,7 @@ The BM-OverlayMonitor plugin monitors admin commands, camera usage, and game sta
   "enabled": true,
   "cloudflareWorkerUrl": "https://squadjs-admin-monitor-worker.itsdast0m.workers.dev",
   "workerApiKey": "your-secure-api-key-here",
-  "updateInterval": 5000,
+  "updateInterval": 15000,
   "maxCameraSessionsHistory": 50,
   "retryAttempts": 3,
   "disconnectTimeoutSeconds": 30
@@ -56,10 +56,10 @@ The BM-OverlayMonitor plugin monitors admin commands, camera usage, and game sta
   "cloudflareWorkerUrl": "https://your-worker.workers.dev",
   "workerApiKey": "your-secure-api-key-here",
   "serverIdentifier": "custom_server_name",
-  "updateInterval": 10000,
-  "maxCameraSessionsHistory": 100,
+  "updateInterval": 15000,
+  "maxCameraSessionsHistory": 50,
   "retryAttempts": 5,
-  "disconnectTimeoutSeconds": 60
+  "disconnectTimeoutSeconds": 30
 }
 ```
 
@@ -505,3 +505,4 @@ To test the auto-update functionality:
 ---
 
 **Note**: This plugin is designed for BM Overlay integration and provides comprehensive admin activity monitoring for SquadJS servers with advanced features like auto-updates, disconnect tracking, and stealth monitoring support.
+
