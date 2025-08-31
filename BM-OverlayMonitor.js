@@ -7,7 +7,7 @@ import { AutoUpdater } from '../utils/auto-updater.js';
 // Plugin version and repository information
 const PLUGIN_VERSION = 'v1.0.0';
 const GITHUB_OWNER = 'Armyrat60';
-const GITHUB_REPO = 'SquadJS-BM-OverlayMonitor';
+const GITHUB_REPO = 'SquadJS-BM-Overlay-Monitor';
 
 export default class BMOverlayMonitor extends BasePlugin {
   static get name() {
