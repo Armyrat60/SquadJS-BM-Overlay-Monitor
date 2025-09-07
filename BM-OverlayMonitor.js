@@ -2,7 +2,7 @@
 import BasePlugin from './base-plugin.js';
 import axios from 'axios';
 import { fileURLToPath } from 'url';
-import { AutoUpdater } from '../utils/auto-updater.js';
+import { UpdateManager } from '../utils/update-manager.js';
 
 // Plugin version and repository information
 const PLUGIN_VERSION = 'v1.0.0';
@@ -58,6 +58,11 @@ export default class BMOverlayMonitor extends BasePlugin {
         required: false,
         description: 'Seconds to wait before cleaning up disconnected admin sessions',
         default: 30
+      },
+      disconnectCheckInterval: {
+        required: false,
+        description: 'How often to check for missing admins (ms) - helps detect Alt+F4 disconnects',
+        default: 10000
       }
     };
   }
@@ -83,20 +88,16 @@ export default class BMOverlayMonitor extends BasePlugin {
     this.adminCameraWarningsPlugin = null;
     this.tryGetAdminCameraWarningsPlugin();
     
-    // Initialize auto-updater utility
+    // Register with UpdateManager
     const pluginPath = fileURLToPath(import.meta.url);
-    this.autoUpdater = new AutoUpdater(
+    this.updateInfo = UpdateManager.registerPlugin(
       'BM-OverlayMonitor',
       PLUGIN_VERSION,
       GITHUB_OWNER,
       GITHUB_REPO,
-      pluginPath
+      pluginPath,
+      (message, ...args) => this.verbose(1, message, ...args)
     );
-
-    // Override the log method to use plugin's verbose system
-    this.autoUpdater.log = (message, ...args) => {
-      this.verbose(1, message, ...args);
-    };
     
     // Bind event handlers
     this.onChatCommand = this.onChatCommand.bind(this);
@@ -125,9 +126,11 @@ export default class BMOverlayMonitor extends BasePlugin {
     // Disconnect tracking
     this.disconnectTimeouts = new Map(); // eosID -> timeout reference
     this.orphanedSessions = new Map(); // eosID -> orphaned session data
+    this.lastKnownPlayers = new Set(); // Track last known player EOS IDs
     
     // Interval reference for cleanup
     this.updateInterval = null;
+    this.disconnectCheckInterval = null;
     
     this.setupDataTransfer();
   }
@@ -194,55 +197,14 @@ export default class BMOverlayMonitor extends BasePlugin {
     this.server.on('PLAYER_DISCONNECTED', this.onPlayerDisconnected);
     this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
     
+    // Set up periodic disconnect checking for Alt+F4 detection
+    this.setupDisconnectChecking();
+    
     // Add test command for auto-updater
     this.server.on('CHAT_COMMAND:!bmupdate', this.onBmUpdateCommand.bind(this));
     
     this.verbose(1, `BMOverlayMonitor mounted for ${this.options.serverIdentifier}`);
-    
-    // Wait for SquadJS to be fully initialized before checking for updates
-    this.verbose(1, `⏳ Waiting for SquadJS to fully initialize before checking for updates...`);
-    setTimeout(async () => {
-      try {
-        this.verbose(1, `🔄 Checking for updates... Current version: ${PLUGIN_VERSION}`);
-        const updateResult = await this.autoUpdater.autoUpdate();
-        
-        if (updateResult.updated) {
-          this.verbose(1, `🎉 Plugin updated successfully to version ${updateResult.newVersion}`);
-          this.verbose(1, `🔄 Please restart SquadJS to apply the update`);
-          
-          // Emit event for AutoUpdatePlugin to handle
-          this.server.emit('PLUGIN_UPDATED', 'BM-OverlayMonitor', PLUGIN_VERSION, updateResult.newVersion, updateResult.backupPath);
-          this.server.emit('RESTART_REQUIRED', 'BM-OverlayMonitor');
-        } else if (updateResult.error) {
-          this.verbose(1, `⚠️  Update check failed: ${updateResult.error}`);
-        } else {
-          this.verbose(1, `✅ Plugin is up to date or no update needed`);
-        }
-      } catch (error) {
-        this.verbose(1, `❌ Update check error: ${error.message}`);
-      }
-    }, 15000); // Wait 15 seconds for SquadJS to fully initialize
-    
-    // Set up periodic update checks every 30 minutes
-    this.updateInterval = setInterval(async () => {
-      try {
-        const result = await this.autoUpdater.autoUpdate();
-        if (result.updated) {
-          this.verbose(1, `🎉 Plugin auto-updated to version ${result.newVersion}`);
-          this.verbose(1, `🔄 Please restart SquadJS to apply the update`);
-          
-          // Emit event for AutoUpdatePlugin to handle
-          this.server.emit('PLUGIN_UPDATED', 'BM-OverlayMonitor', PLUGIN_VERSION, result.newVersion, result.backupPath);
-          this.server.emit('RESTART_REQUIRED', 'BM-OverlayMonitor');
-        } else if (result.error) {
-          this.verbose(1, `⚠️  Periodic update check failed: ${result.error}`);
-        }
-      } catch (error) {
-        this.verbose(1, `❌ Periodic update check error: ${error.message}`);
-      }
-    }, 30 * 60 * 1000);
-    
-    this.verbose(1, '⏰ Auto-update checks scheduled every 30 minutes');
+    this.verbose(1, `📝 Registered with UpdateManager for automatic updates`);
   }
 
   async unmount() {
@@ -258,9 +220,11 @@ export default class BMOverlayMonitor extends BasePlugin {
     // Remove test command listener
     this.server.off('CHAT_COMMAND:!bmupdate', this.onBmUpdateCommand);
     
-    // Clear update interval
-    if (this.updateInterval) {
-      clearInterval(this.updateInterval);
+    // UpdateManager handles its own cleanup
+    
+    // Clear disconnect check interval
+    if (this.disconnectCheckInterval) {
+      clearInterval(this.disconnectCheckInterval);
     }
     
     // Clear disconnect timeouts
@@ -269,6 +233,7 @@ export default class BMOverlayMonitor extends BasePlugin {
     }
     this.disconnectTimeouts.clear();
     this.orphanedSessions.clear();
+    this.lastKnownPlayers.clear();
     
     this.verbose(1, `BMOverlayMonitor unmounted for ${this.options.serverIdentifier}`);
   }
@@ -477,6 +442,9 @@ export default class BMOverlayMonitor extends BasePlugin {
     const timeout = this.disconnectTimeouts.get(playerEosID);
     const orphanedSession = this.orphanedSessions.get(playerEosID);
 
+    // Add to last known players
+    this.lastKnownPlayers.add(playerEosID);
+
     if (timeout) {
       // Clear the disconnect timeout since they reconnected
       clearTimeout(timeout);
@@ -509,6 +477,110 @@ export default class BMOverlayMonitor extends BasePlugin {
     }
   }
 
+  // Set up periodic disconnect checking for Alt+F4 detection
+  setupDisconnectChecking() {
+    // Check for missing admins at configured interval
+    this.disconnectCheckInterval = setInterval(() => {
+      this.checkForMissingAdmins();
+    }, this.options.disconnectCheckInterval);
+    
+    this.verbose(1, `🔍 Periodic disconnect checking enabled (every ${this.options.disconnectCheckInterval / 1000} seconds)`);
+  }
+
+  // Check for missing admins who may have Alt+F4'd
+  checkForMissingAdmins() {
+    try {
+      const currentPlayerEosIDs = new Set();
+      
+      // Get current online players
+      if (this.server.players) {
+        for (const player of this.server.players) {
+          if (player.eosID) {
+            currentPlayerEosIDs.add(player.eosID);
+          }
+        }
+      }
+      
+      // Check for admins in camera who are no longer online
+      for (const [eosID, enterTime] of this.adminActivity.adminsInCamera) {
+        if (!currentPlayerEosIDs.has(eosID)) {
+          // This admin is no longer online but we still have them in camera tracking
+          // Check if we already have a timeout for them
+          if (!this.disconnectTimeouts.has(eosID)) {
+            this.verbose(1, `🔍 Detected missing admin (EOS: ${eosID}) - likely Alt+F4 or crash`);
+            
+            // Find the player info from last known players or create a fallback
+            let playerName = 'Unknown Admin';
+            let steamID = 'Unknown';
+            let teamID = 0;
+            let squadID = 0;
+            
+            // Try to find player info from server data
+            for (const player of this.server.players || []) {
+              if (player.eosID === eosID) {
+                playerName = player.name || 'Unknown Admin';
+                steamID = player.steamID || 'Unknown';
+                teamID = player.teamID || 0;
+                squadID = player.squadID || 0;
+                break;
+              }
+            }
+            
+            // Check if player should be ignored
+            const playerInfo = { eosID, name: playerName, steamID, teamID, squadID };
+            if (this.isPlayerIgnored(playerInfo)) {
+              this.verbose(1, `Admin ${playerName} is in ignore list, skipping missing admin detection`);
+              // Remove from camera tracking but don't send notifications
+              this.adminActivity.adminsInCamera.delete(eosID);
+              continue;
+            }
+            
+            // Set up disconnect tracking
+            const timeout = setTimeout(() => {
+              this.cleanupOrphanedSession(eosID, playerName);
+            }, this.options.disconnectTimeoutSeconds * 1000);
+
+            this.disconnectTimeouts.set(eosID, timeout);
+            this.orphanedSessions.set(eosID, {
+              admin: playerName,
+              steamID: steamID,
+              eosID: eosID,
+              startTime: enterTime,
+              disconnectTime: Date.now(),
+              playerName: playerName,
+              detectedBy: 'periodic_check'
+            });
+            
+            // Send immediate disconnect notification
+            const disconnectData = {
+              type: 'admin_camera_disconnect',
+              serverIdentifier: this.options.serverIdentifier,
+              timestamp: Date.now(),
+              admin: {
+                name: playerName,
+                steamID: steamID,
+                eosID: eosID,
+                teamID: teamID,
+                squadID: squadID
+              },
+              action: 'disconnected_in_admin_camera',
+              detectedBy: 'periodic_check',
+              activeAdminsInCamera: this.adminActivity.adminsInCamera.size - 1
+            };
+            
+            this.sendDataToWorkerWithRetry(disconnectData);
+          }
+        }
+      }
+      
+      // Update last known players
+      this.lastKnownPlayers = currentPlayerEosIDs;
+      
+    } catch (error) {
+      this.verbose(1, 'Error in periodic disconnect check:', error.message);
+    }
+  }
+
   // Clean up orphaned session after timeout
   cleanupOrphanedSession(eosID, playerName) {
     const orphanedSession = this.orphanedSessions.get(eosID);
@@ -530,7 +602,7 @@ export default class BMOverlayMonitor extends BasePlugin {
       duration: sessionDuration,
       timestamp: currentTime,
       orphaned: true,
-      orphanReason: 'disconnect'
+      orphanReason: orphanedSession.detectedBy || 'disconnect'
     });
     
     // Maintain session history limit
@@ -552,12 +624,14 @@ export default class BMOverlayMonitor extends BasePlugin {
       },
       action: 'session_cleaned_up_after_disconnect',
       sessionDuration: sessionDuration,
+      detectedBy: orphanedSession.detectedBy || 'event',
       activeAdminsInCamera: this.adminActivity.adminsInCamera.size
     };
     
     this.sendDataToWorkerWithRetry(cleanupData);
     
-    this.verbose(1, `Cleaned up orphaned session for ${playerName} after ${Math.round(sessionDuration / 1000)}s (disconnected)`);
+    const detectionMethod = orphanedSession.detectedBy || 'event';
+    this.verbose(1, `Cleaned up orphaned session for ${playerName} after ${Math.round(sessionDuration / 1000)}s (${detectionMethod})`);
   }
 
   // Handle new game start
@@ -577,6 +651,7 @@ export default class BMOverlayMonitor extends BasePlugin {
       }
       this.disconnectTimeouts.clear();
       this.orphanedSessions.clear();
+      this.lastKnownPlayers.clear();
 
       const newGameData = {
         type: 'new_game',
@@ -714,7 +789,7 @@ export default class BMOverlayMonitor extends BasePlugin {
     }
   }
 
-  // Test command for auto-updater functionality
+  // Test command for UpdateManager functionality
   async onBmUpdateCommand(info) {
     const player = this.server.getPlayerByEOSID(info.player.eosID);
     if (!player || !this.server.isAdmin(player.steamID)) {
@@ -725,20 +800,25 @@ export default class BMOverlayMonitor extends BasePlugin {
     try {
       await this.server.rcon.warn(info.player.eosID, '🔄 Manually checking for updates...');
       
-      const updateResult = await this.autoUpdater.autoUpdate();
+      // Check for updates using UpdateManager
+      await UpdateManager.checkPluginUpdates('BM-OverlayMonitor');
       
-      if (updateResult.updated) {
-        await this.server.rcon.warn(info.player.eosID, `🎉 Plugin updated to version ${updateResult.newVersion}`);
-        await this.server.rcon.warn(info.player.eosID, '🔄 Please restart SquadJS to apply the update');
-        
-        // Emit event for AutoUpdatePlugin to handle
-        this.server.emit('PLUGIN_UPDATED', 'BM-OverlayMonitor', PLUGIN_VERSION, updateResult.newVersion, updateResult.backupPath);
-        this.server.emit('RESTART_REQUIRED', 'BM-OverlayMonitor');
-      } else if (updateResult.error) {
-        await this.server.rcon.warn(info.player.eosID, `⚠️ Update check failed: ${updateResult.error}`);
+      // Get update status
+      const status = UpdateManager.getUpdateStatus();
+      const pluginInfo = UpdateManager.getPluginInfo('BM-OverlayMonitor');
+      
+      if (pluginInfo && pluginInfo.needsUpdate) {
+        await this.server.rcon.warn(info.player.eosID, `🔄 Update available: ${pluginInfo.version} → ${pluginInfo.latestVersion}`);
+        await this.server.rcon.warn(info.player.eosID, '🔄 Update will be applied automatically by UpdateManager');
+      } else if (pluginInfo && pluginInfo.error) {
+        await this.server.rcon.warn(info.player.eosID, `⚠️ Update check failed: ${pluginInfo.error}`);
       } else {
-        await this.server.rcon.warn(info.player.eosID, '✅ Plugin is up to date');
+        await this.server.rcon.warn(info.player.eosID, `✅ Plugin is up to date (${pluginInfo?.version || PLUGIN_VERSION})`);
       }
+      
+      // Show overall update status
+      await this.server.rcon.warn(info.player.eosID, `📊 Total plugins checked: ${status.totalChecked}, Updates available: ${status.updatesAvailable}`);
+      
     } catch (error) {
       await this.server.rcon.warn(info.player.eosID, `❌ Update check error: ${error.message}`);
     }
