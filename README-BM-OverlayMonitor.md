@@ -1,4 +1,4 @@
-# BM-OverlayMonitor Plugin - Frontend Integration Guide
+# BM-OverlayMonitor Plugin  Guide
 
 ## Overview
 
@@ -388,3 +388,4 @@ function handleBMOverlayEvent(event) {
 ```
 
 This plugin provides comprehensive admin activity monitoring for SquadJS servers with real-time data transmission to your Cloudflare Worker for BM Overlay integration.
+
